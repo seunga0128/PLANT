@@ -1,0 +1,1224 @@
+# ============================================================
+#  당곡고 SCD30 CO2 식물 분석 대시보드  ·  main.py
+#  보드 : Raspberry Pi Pico 2 W
+#  센서 : SCD30 (I2C0 / GP8, GP9)
+#  LED  : NeoPixel 60개 → GP16
+# ============================================================
+
+import network
+import socket
+import ssl
+import time
+import json
+import struct
+import utime
+import gc
+import ntptime
+from machine import I2C, Pin, RTC
+from neopixel import NeoPixel
+from wifi_config import WIFI_SSID, WIFI_PASSWORD
+
+# ──────────────────────────────────────────────
+#  설정값
+# ──────────────────────────────────────────────
+GOOGLE_SHEET_URL   = "https://script.google.com/macros/s/AKfycbzpTORy5Tvndq0dS-KBdO9Dj-RavA4Pcd_G0MoY3nJHEW1PFNIPeatoDYl4VVfor8HN/exec"
+SHEET_LOG_INTERVAL = 10
+THRESHOLD_CAUTION  = 1000
+THRESHOLD_DANGER   = 1500
+GRAPH_MAX_POINTS   = 60
+
+# CO2 기준 베이스 (ppm) — 밀폐 용기 기준
+CO2_BASE = 800.0
+
+# 실제 vs 예상 차이가 이 이상이면 보조광 ON
+LIGHT_THRESHOLD = 150.0
+
+# ──────────────────────────────────────────────
+#  NeoPixel
+# ──────────────────────────────────────────────
+NUM_PIXELS = 60
+np = NeoPixel(Pin(16), NUM_PIXELS)
+
+def np_off():
+    for i in range(NUM_PIXELS):
+        np[i] = (0, 0, 0)
+    np.write()
+
+def np_fill(r, g, b):
+    for i in range(NUM_PIXELS):
+        np[i] = (r, g, b)
+    np.write()
+
+def np_progress(ratio):
+    count = int(ratio * NUM_PIXELS)
+    for i in range(NUM_PIXELS):
+        if i < count:
+            if ratio < 0.5:
+                r = int(ratio * 2 * 255)
+                g = 200
+            else:
+                r = 200
+                g = int((1.0 - (ratio - 0.5) * 2) * 200)
+            np[i] = (r, g, 0)
+        else:
+            np[i] = (0, 0, 0)
+    np.write()
+
+NP_STATE = {
+    "mode":         "idle",
+    "blink_tick":   0,
+    "blink_on":     False,
+    "light_on":     False,
+    "light_reason": "",
+    "expected_co2": 0.0,
+    "diff":         0.0,
+}
+
+def apply_np_state(co2_val):
+    mode = NP_STATE["mode"]
+    now  = time.ticks_ms()
+
+    if mode == "danger":
+        if time.ticks_diff(now, NP_STATE["blink_tick"]) >= 300:
+            NP_STATE["blink_tick"] = now
+            NP_STATE["blink_on"]   = not NP_STATE["blink_on"]
+        if NP_STATE["blink_on"]: np_fill(150, 0, 0)
+        else:                    np_off()
+
+    elif mode == "caution":
+        if time.ticks_diff(now, NP_STATE["blink_tick"]) >= 1000:
+            NP_STATE["blink_tick"] = now
+            NP_STATE["blink_on"]   = not NP_STATE["blink_on"]
+        if NP_STATE["blink_on"]: np_fill(80, 50, 0)
+        else:                    np_off()
+
+    elif mode == "light_assist":
+        # 보조광 — 밝은 흰색
+        np_fill(220, 220, 190)
+
+    elif mode == "good":
+        # 광합성 잘 됨 — 초록 게이지
+        MIN_CO2 = 400; MAX_CO2 = 2000
+        ratio = min(max((co2_val - MIN_CO2) / (MAX_CO2 - MIN_CO2), 0.0), 1.0)
+        np_progress(ratio)
+
+    elif mode == "cam_night":
+        np_fill(0, 0, 100)   # 파랑 — CAM 야간 흡수
+
+    elif mode == "cam_day":
+        np_fill(60, 40, 0)   # 어두운 노랑 — CAM 주간 대기
+
+    else:
+        np_fill(0, 0, 15)
+
+
+# ──────────────────────────────────────────────
+#  식물 프로파일
+#  hourly_co2_offset : 시간대별 예상 CO2 오프셋
+#  (CO2_BASE 기준, 음수 = 흡수, 양수 = 배출)
+# ──────────────────────────────────────────────
+PLANT_PROFILES = {
+    "CAM": {
+        "name":  "CAM 식물 (선인장/다육이)",
+        "emoji": "🌵",
+        "color": "#22c55e",
+        "hourly_co2_offset": [
+            -80, -90, -100, -90, -80, -50,   # 0~5시  (기공 열림, 흡수)
+              0,  30,   50,  60,  60,  50,   # 6~11시 (주간, 기공 닫힘)
+             40,  30,   20,  10,   0, -10,   # 12~17시
+            -30, -50,  -70, -80, -80, -80    # 18~23시 (기공 열리기 시작)
+        ]
+    },
+    "C3": {
+        "name":  "C3 식물 (일반 나무/풀)",
+        "emoji": "🌳",
+        "color": "#3b82f6",
+        "hourly_co2_offset": [
+             50,  60,  60,  50,  30,  10,   # 0~5시  (야간 호흡, 배출)
+            -20, -50, -80,-100,-100, -90,   # 6~11시 (광합성 활발, 흡수)
+            -80, -90, -80, -60, -40, -10,   # 12~17시
+             10,  20,  30,  40,  40,  50    # 18~23시 (저녁, 배출 시작)
+        ]
+    },
+    "C4": {
+        "name":  "C4 식물 (옥수수/사탕수수)",
+        "emoji": "🌾",
+        "color": "#f59e0b",
+        "hourly_co2_offset": [
+             40,  50,  50,  40,  30,  10,
+            -10, -40, -80,-100,-100,-100,
+           -100,-100, -90, -70, -40, -10,
+             10,  20,  30,  30,  40,  40
+        ]
+    }
+}
+
+
+# ──────────────────────────────────────────────
+#  SCD30 드라이버
+# ──────────────────────────────────────────────
+class SCD30:
+    class NotFoundException(Exception): pass
+    class CRCException(Exception): pass
+
+    START_CONT_MEASURE = 0x0010
+    GET_STATUS_READY   = 0x0202
+    READ_MEASUREMENT   = 0x0300
+
+    def __init__(self, i2c, addr=0x61, pause=1000):
+        self.i2c   = i2c
+        self.pause = pause
+        self.addr  = addr
+        if addr not in i2c.scan():
+            raise self.NotFoundException()
+
+    def start_cont_measure(self, pressure=0):
+        self._write_cmd(self.START_CONT_MEASURE, pressure)
+
+    def get_status_ready(self):
+        ready = self._read_bytes(self.GET_STATUS_READY, 3)
+        return struct.unpack('>H', ready[0:2])[0] == 1
+
+    def read_measurement(self):
+        m = self._read_bytes(self.READ_MEASUREMENT, 18)
+        for i in range(0, len(m), 3):
+            self._check_crc(m[i:i+2], m[i+2])
+        co2  = struct.unpack('>f', m[0:2]  + m[3:5])[0]
+        temp = struct.unpack('>f', m[6:8]  + m[9:11])[0]
+        humi = struct.unpack('>f', m[12:14]+ m[15:17])[0]
+        return (co2, temp, humi)
+
+    def _write_cmd(self, cmd, val=None):
+        buf = bytearray(2)
+        struct.pack_into('>H', buf, 0, cmd)
+        if val is not None:
+            buf.extend(struct.pack('>H', val))
+            buf.append(self._calc_crc(buf[2:4]))
+        self.i2c.writeto(self.addr, buf)
+
+    def _read_bytes(self, cmd, count):
+        self._write_cmd(cmd)
+        utime.sleep_us(self.pause)
+        return self.i2c.readfrom(self.addr, count)
+
+    def _check_crc(self, data, checksum):
+        if self._calc_crc(data) != checksum:
+            raise self.CRCException()
+
+    def _calc_crc(self, data):
+        crc = 0xFF
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                crc = ((crc << 1) ^ 0x31) if (crc & 0x80) else (crc << 1)
+                crc &= 0xFF
+        return crc
+
+
+# ──────────────────────────────────────────────
+#  Wi-Fi + NTP 시간 동기화
+# ──────────────────────────────────────────────
+board_led = Pin("LED", Pin.OUT)
+rtc       = RTC()
+
+def connect_wifi():
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(False)
+    time.sleep(0.5)
+    wlan.active(True)
+    time.sleep(0.5)
+
+    if wlan.isconnected():
+        print("[WiFi] 이미 연결됨:", wlan.ifconfig()[0])
+        board_led.on()
+        return wlan.ifconfig()[0]
+
+    print("[WiFi] 연결 중:", WIFI_SSID)
+    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+    timeout = 20
+    while not wlan.isconnected() and timeout > 0:
+        board_led.toggle()
+        time.sleep(0.5)
+        timeout -= 1
+
+    if wlan.isconnected():
+        ip = wlan.ifconfig()[0]
+        print("[WiFi] 연결 성공! IP:", ip)
+        board_led.on()
+        return ip
+    else:
+        print("[WiFi] 연결 실패 상태코드:", wlan.status())
+        board_led.off()
+        return "0.0.0.0"
+
+def sync_ntp():
+    """인터넷에서 현재 시각을 받아와서 RTC에 설정"""
+    try:
+        ntptime.host = "pool.ntp.org"
+        ntptime.settime()   # UTC 기준으로 설정됨
+        # 한국 시간 = UTC + 9시간
+        t   = utime.localtime(utime.mktime(utime.localtime()) + 9 * 3600)
+        rtc.datetime((t[0], t[1], t[2], t[6], t[3], t[4], t[5], 0))
+        print("[NTP] 시간 동기화 완료: {:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
+            t[0], t[1], t[2], t[3], t[4], t[5]))
+        return True
+    except Exception as e:
+        print("[NTP] 실패:", e)
+        return False
+
+def get_current_hour():
+    """현재 시각의 시(hour) 반환 (0~23)"""
+    dt = rtc.datetime()
+    return dt[4]   # (year, month, day, weekday, hour, min, sec, subsec)
+
+def get_time_str():
+    dt = rtc.datetime()
+    return "{:02d}:{:02d}:{:02d}".format(dt[4], dt[5], dt[6])
+
+
+# ──────────────────────────────────────────────
+#  핵심 함수 — 시간대별 예상 CO2 계산 & 보조광 판단
+# ──────────────────────────────────────────────
+def get_expected_co2(plant_type, hour):
+    """현재 시각 기준 이 식물의 예상 CO2 계산"""
+    profile = PLANT_PROFILES.get(plant_type, PLANT_PROFILES["C3"])
+    offset  = profile["hourly_co2_offset"][hour]
+    return CO2_BASE + offset
+
+def update_light_status(co2_val, plant_type, co2_level):
+    """
+    예상 CO2 vs 실제 CO2 비교 후 보조광 ON/OFF 결정
+    
+    판단 기준:
+    - 위험/주의 → 경고 우선 (보조광 X)
+    - 실제 CO2 > 예상 CO2 + THRESHOLD → 광합성 부족 → 보조광 ON
+    - 실제 CO2 <= 예상 CO2 + THRESHOLD → 정상 → 보조광 OFF
+    """
+    hour     = get_current_hour()
+    expected = get_expected_co2(plant_type, hour)
+    diff     = co2_val - expected   # 양수 = 실제가 더 높음 (광합성 부족)
+
+    NP_STATE["expected_co2"] = expected
+    NP_STATE["diff"]         = diff
+
+    # 위험/주의 최우선
+    if co2_level == "danger":
+        NP_STATE["mode"]        = "danger"
+        NP_STATE["light_on"]    = False
+        NP_STATE["light_reason"] = "CO2 위험 — 환기 필요!"
+        return
+
+    if co2_level == "caution":
+        NP_STATE["mode"]        = "caution"
+        NP_STATE["light_on"]    = False
+        NP_STATE["light_reason"] = "CO2 주의 — 환기 권장"
+        return
+
+    # CAM 식물 특별 처리
+    if plant_type == "CAM":
+        if hour >= 20 or hour < 6:
+            # CAM 야간 → 기공 열림 → CO2 흡수 중
+            if diff > LIGHT_THRESHOLD:
+                # 흡수가 안 되고 있음 — 보조광 의미 없음
+                # (CAM은 빛이 아니라 어둠에서 흡수)
+                NP_STATE["mode"]        = "cam_night"
+                NP_STATE["light_on"]    = False
+                NP_STATE["light_reason"] = (
+                    "CAM 야간 — CO2 흡수 부족 ({:.0f}ppm 초과)".format(diff)
+                    + " / 빛 대신 환기 확인!"
+                )
+            else:
+                NP_STATE["mode"]        = "cam_night"
+                NP_STATE["light_on"]    = False
+                NP_STATE["light_reason"] = "CAM 야간 흡수 정상 ({:+.0f}ppm)".format(-diff)
+        else:
+            # CAM 주간 → 기공 닫힘 → CO2 증가 정상
+            NP_STATE["mode"]        = "cam_day"
+            NP_STATE["light_on"]    = False
+            NP_STATE["light_reason"] = "CAM 주간 — 기공 닫힘 정상"
+        return
+
+    # C3 / C4 식물
+    if diff > LIGHT_THRESHOLD:
+        # 실제 CO2 > 예상 CO2  → 광합성 부족 → 보조광 ON!
+        NP_STATE["mode"]        = "light_assist"
+        NP_STATE["light_on"]    = True
+        NP_STATE["light_reason"] = (
+            "광합성 부족! 예상 {:.0f}ppm / 실제 {:.0f}ppm "
+            "(+{:.0f}ppm 초과) → 보조광 공급"
+        ).format(expected, co2_val, diff)
+    else:
+        # 정상 범위
+        NP_STATE["mode"]        = "good"
+        NP_STATE["light_on"]    = False
+        NP_STATE["light_reason"] = (
+            "광합성 정상! 예상 {:.0f}ppm / 실제 {:.0f}ppm "
+            "({:+.0f}ppm)"
+        ).format(expected, co2_val, diff)
+
+
+# ──────────────────────────────────────────────
+#  하드웨어 초기화
+# ──────────────────────────────────────────────
+sensor = None
+for (bus, sda, scl) in [(0, 8, 9), (1, 6, 7)]:
+    try:
+        i2c    = I2C(bus, sda=Pin(sda), scl=Pin(scl), freq=50000)
+        sensor = SCD30(i2c, addr=0x61)
+        print("SCD30 연결 완료 I2C{} GP{}/GP{}".format(bus, sda, scl))
+        break
+    except Exception:
+        pass
+
+if sensor is None:
+    print("센서 없음 — 더미 데이터 모드")
+else:
+    sensor.start_cont_measure()
+
+print("[NeoPixel] 테스트...")
+np_fill(220, 220, 190); time.sleep(0.3)
+np_fill(0, 150, 0)    ; time.sleep(0.3)
+np_fill(0, 0, 100)    ; time.sleep(0.3)
+np_fill(150, 0, 0)    ; time.sleep(0.3)
+np_off()
+print("[NeoPixel] 완료")
+
+ip_address = connect_wifi()
+
+# NTP 시간 동기화
+ntp_ok = False
+if ip_address != "0.0.0.0":
+    ntp_ok = sync_ntp()
+
+if not ntp_ok:
+    print("[주의] 시간 동기화 실패 — 수동으로 시각 설정")
+    # 수동 설정 (연,월,일,요일,시,분,초,서브초)
+    rtc.datetime((2026, 7, 22, 0, 14, 0, 0, 0))
+
+
+# ──────────────────────────────────────────────
+#  상태 변수
+# ──────────────────────────────────────────────
+state = {
+    "co2":        0.0,
+    "temp":       0.0,
+    "humi":       0.0,
+    "level":      "safe",
+    "co2_history": [],
+    "ts":         [],
+    "uptime":     0,
+    "plant_type": "",
+    "elapsed_min": 0,
+}
+start_tick      = time.ticks_ms()
+last_sheet_tick = start_tick
+
+
+def classify_co2(v):
+    if v < THRESHOLD_CAUTION:  return "safe"
+    elif v < THRESHOLD_DANGER: return "caution"
+    return "danger"
+
+def gen_dummy_co2(plant_type, hour):
+    profile = PLANT_PROFILES.get(plant_type, PLANT_PROFILES["C3"])
+    offset  = profile["hourly_co2_offset"][hour]
+    noise   = (utime.ticks_ms() % 17 - 8) * 0.5
+    return CO2_BASE + offset + noise
+
+
+# ──────────────────────────────────────────────
+#  구글 시트 전송
+# ──────────────────────────────────────────────
+def https_get(url):
+    host, _, path = url[8:].partition("/")
+    gc.collect()
+    raw_sock = socket.socket()
+    try:
+        raw_sock.connect(socket.getaddrinfo(host, 443)[0][-1])
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.verify_mode = ssl.CERT_NONE
+            sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+        except AttributeError:
+            sock = ssl.wrap_socket(raw_sock, server_hostname=host)
+        sock.write((
+            "GET /{} HTTP/1.0\r\n"
+            "Host: {}\r\n"
+            "User-Agent: Pico2W\r\n"
+            "Connection: close\r\n\r\n"
+        ).format(path, host).encode("utf-8"))
+        buf = b""
+        while True:
+            chunk = sock.read(512)
+            if not chunk: break
+            buf += chunk
+            if b"\r\n\r\n" in buf: break
+        return buf
+    finally:
+        try: raw_sock.close()
+        except: pass
+
+def send_to_sheet(co2, temp, humi, plant_type, expected, diff, light_on):
+    url = (
+        GOOGLE_SHEET_URL
+        + "?co2="      + "{:.1f}".format(co2)
+        + "&temp="     + "{:.1f}".format(temp)
+        + "&humi="     + "{:.1f}".format(humi)
+        + "&plant="    + plant_type
+        + "&expected=" + "{:.1f}".format(expected)
+        + "&diff="     + "{:.1f}".format(diff)
+        + "&light="    + ("ON" if light_on else "OFF")
+    )
+    print("[Sheet] CO2={:.0f} 예상={:.0f} 차이={:+.0f} 보조광={}".format(
+        co2, expected, diff, "ON" if light_on else "OFF"))
+    try:
+        resp = https_get(url)
+        head = resp.split(b"\r\n\r\n", 1)[0]
+        if b" 302 " in head or b" 301 " in head:
+            for line in head.split(b"\r\n"):
+                if line.lower().startswith(b"location:"):
+                    redirect_url = line.split(b":", 1)[1].strip().decode()
+                    https_get(redirect_url)
+                    break
+        print("[Sheet] 전송 완료")
+    except Exception as e:
+        print("[Sheet] 실패:", e)
+
+
+# ──────────────────────────────────────────────
+#  설정 페이지
+# ──────────────────────────────────────────────
+SETUP_PAGE = """<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>식물 설정</title>
+<style>
+:root{--bg:#0f1117;--card:#1a1d27;--border:#2e3148;--text:#e2e8f0;--sub:#8892a4;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;
+  min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;}
+.wrap{max-width:760px;width:100%;}
+h1{text-align:center;font-size:1.5rem;margin-bottom:6px;}
+.sub{text-align:center;color:var(--sub);font-size:.85rem;margin-bottom:28px;}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+  gap:16px;margin-bottom:24px;}
+.plant-card{background:var(--card);border:2px solid var(--border);
+  border-radius:16px;padding:24px 16px;text-align:center;cursor:pointer;transition:.2s;}
+.plant-card:hover{border-color:#60a5fa;transform:translateY(-3px);}
+.plant-card.selected{border-color:#22c55e;background:#0d2818;}
+.emoji{font-size:3rem;margin-bottom:10px;}
+.pname{font-size:1rem;font-weight:700;margin-bottom:6px;}
+.pdesc{font-size:.78rem;color:var(--sub);line-height:1.5;}
+.pex{font-size:.72rem;color:#60a5fa;margin-top:8px;}
+.info-box{background:var(--card);border:1px solid var(--border);
+  border-radius:12px;padding:16px;margin-bottom:24px;font-size:.82rem;line-height:1.8;}
+.info-box h3{font-size:.9rem;margin-bottom:8px;color:var(--sub);}
+.btn{display:block;width:100%;max-width:320px;margin:0 auto;padding:14px;
+  background:#22c55e;color:#000;font-size:1rem;font-weight:700;
+  border:none;border-radius:12px;cursor:pointer;}
+.btn:disabled{background:#374151;color:#6b7280;cursor:not-allowed;}
+.hint{text-align:center;color:var(--sub);font-size:.78rem;margin-top:12px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🌱 식물 유형 선택</h1>
+  <p class="sub">측정할 식물의 광합성 경로를 선택하세요.</p>
+  <div class="cards">
+    <div class="plant-card" onclick="sel('CAM')" id="c-CAM">
+      <div class="emoji">🌵</div>
+      <div class="pname">CAM 식물</div>
+      <div class="pdesc">밤에 CO2 흡수<br>낮에 기공 닫힘</div>
+      <div class="pex">선인장, 알로에, 용설란</div>
+    </div>
+    <div class="plant-card" onclick="sel('C3')" id="c-C3">
+      <div class="emoji">🌳</div>
+      <div class="pname">C3 식물</div>
+      <div class="pdesc">낮에 광합성 흡수<br>밤에 호흡 배출</div>
+      <div class="pex">참나무, 소나무, 상추</div>
+    </div>
+    <div class="plant-card" onclick="sel('C4')" id="c-C4">
+      <div class="emoji">🌾</div>
+      <div class="pname">C4 식물</div>
+      <div class="pdesc">고온·강광 고효율<br>낮 최대 흡수</div>
+      <div class="pex">옥수수, 사탕수수</div>
+    </div>
+  </div>
+  <div class="info-box">
+    <h3>💡 보조광 시스템 동작 원리</h3>
+    시간대별로 이 식물의 CO2가 <b>얼마여야 정상인지</b> 계산합니다.<br>
+    실제 CO2가 예상보다 <b>150ppm 이상 높으면</b> → 광합성 부족!<br>
+    → LED가 <b>밝은 흰색</b>으로 켜져서 빛을 공급해줍니다. 💡<br><br>
+    CAM 식물은 <b>밤에 기공이 열리므로</b> 보조광 대신 상태 표시만 합니다.
+  </div>
+  <button class="btn" id="startBtn" disabled onclick="go()">▶ 측정 시작</button>
+  <p class="hint" id="hint">카드를 클릭해 식물 유형을 선택하세요.</p>
+</div>
+<script>
+var chosen='';
+function sel(t){
+  chosen=t;
+  document.querySelectorAll('.plant-card').forEach(function(c){
+    c.classList.remove('selected');
+  });
+  document.getElementById('c-'+t).classList.add('selected');
+  document.getElementById('startBtn').disabled=false;
+  var nm={CAM:'CAM(선인장류)',C3:'C3(일반 나무)',C4:'C4(옥수수류)'};
+  document.getElementById('hint').textContent=nm[t]+' 선택됨';
+}
+function go(){
+  if(!chosen)return;
+  fetch('/set_plant?type='+chosen).then(function(){location.href='/';});
+}
+</script>
+</body>
+</html>"""
+
+
+# ──────────────────────────────────────────────
+#  대시보드 HTML
+# ──────────────────────────────────────────────
+def build_dashboard_html():
+    ptype   = state["plant_type"]
+    profile = PLANT_PROFILES.get(ptype, PLANT_PROFILES["C3"])
+    color   = profile["color"]
+    emoji   = profile["emoji"]
+    pname   = profile["name"]
+    offset_str = json.dumps(profile["hourly_co2_offset"])
+
+    html = """<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>당곡고 CO2 분석 대시보드</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root{
+  --bg:#0f1117;--card:#1a1d27;--border:#2e3148;
+  --text:#e2e8f0;--sub:#8892a4;
+  --safe:#22c55e;--caution:#f59e0b;--danger:#ef4444;
+  --accent:""" + color + """;
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:var(--bg);color:var(--text);
+  font-family:'Segoe UI',system-ui,sans-serif;
+  min-height:100vh;padding:14px;}
+header{text-align:center;margin-bottom:18px;}
+header h1{font-size:1.35rem;}
+.plant-tag{display:inline-block;margin-top:6px;padding:3px 13px;
+  border-radius:99px;border:1px solid var(--accent);
+  color:var(--accent);font-size:.8rem;font-weight:600;}
+.reset-btn{float:right;background:none;border:1px solid var(--border);
+  color:var(--sub);border-radius:8px;padding:3px 9px;
+  font-size:.73rem;cursor:pointer;margin-top:-26px;}
+.grid4{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+  gap:11px;margin-bottom:14px;}
+.card{background:var(--card);border:1px solid var(--border);
+  border-radius:13px;padding:15px 11px;text-align:center;}
+.card .lbl{font-size:.68rem;color:var(--sub);text-transform:uppercase;}
+.card .val{font-size:1.85rem;font-weight:700;margin:5px 0 2px;}
+.card .unt{font-size:.7rem;color:var(--sub);}
+.badge{display:inline-block;padding:3px 11px;border-radius:99px;
+  font-size:.76rem;font-weight:600;margin-top:3px;}
+.badge.safe{background:rgba(34,197,94,.15);color:var(--safe);border:1px solid var(--safe);}
+.badge.caution{background:rgba(245,158,11,.15);color:var(--caution);border:1px solid var(--caution);}
+.badge.danger{background:rgba(239,68,68,.15);color:var(--danger);border:1px solid var(--danger);}
+
+/* 보조광 패널 */
+.light-panel{border-radius:13px;padding:16px;margin-bottom:14px;
+  border:2px solid var(--border);transition:all .6s;}
+.light-panel.on{background:rgba(255,252,200,.06);border-color:#fffccc;
+  box-shadow:0 0 20px rgba(255,252,150,.15);}
+.light-panel.off{background:var(--card);}
+.lp-top{display:flex;align-items:center;gap:12px;margin-bottom:10px;}
+.lp-icon{font-size:2rem;}
+.lp-title{font-size:1rem;font-weight:700;}
+.lp-sub{font-size:.78rem;color:var(--sub);margin-top:2px;}
+.diff-bar-wrap{height:10px;background:var(--border);border-radius:5px;
+  overflow:hidden;margin:8px 0;}
+.diff-bar{height:100%;border-radius:5px;transition:width .6s,background .6s;}
+.compare-row{display:flex;justify-content:space-between;
+  font-size:.78rem;color:var(--sub);margin-top:4px;}
+.compare-val{font-weight:700;font-size:.9rem;}
+
+.np-strip-wrap{width:100%;height:28px;border-radius:8px;
+  overflow:hidden;background:#111;display:flex;margin-bottom:14px;}
+.strip-seg{flex:1;transition:background .3s;}
+
+.section{background:var(--card);border:1px solid var(--border);
+  border-radius:13px;padding:16px;margin-bottom:14px;}
+.section h2{font-size:.88rem;color:var(--sub);margin-bottom:11px;}
+.chart-wrap{position:relative;height:200px;}
+
+.hour-grid{display:grid;grid-template-columns:repeat(24,1fr);gap:2px;height:40px;}
+.h-bar{border-radius:2px;}
+
+.slider-row{display:flex;align-items:center;gap:10px;margin-bottom:9px;flex-wrap:wrap;}
+.slider-row label{font-size:.78rem;color:var(--sub);min-width:86px;}
+.slider-row input[type=range]{flex:1;min-width:110px;accent-color:var(--accent);}
+.slider-val{min-width:48px;font-size:.8rem;font-weight:600;text-align:right;}
+.sim-result{background:rgba(255,255,255,.04);border-radius:9px;
+  padding:11px;margin-top:6px;font-size:.8rem;line-height:1.9;}
+
+.sheet-badge{font-size:.72rem;padding:2px 9px;border-radius:6px;
+  background:rgba(34,197,94,.1);color:#22c55e;
+  border:1px solid #22c55e;display:inline-block;}
+footer{text-align:center;color:var(--sub);font-size:.72rem;margin-top:6px;}
+</style>
+</head>
+<body>
+<header>
+  <h1>🏫 당곡고 식물 CO2 분석 대시보드</h1>
+  <span class="plant-tag">""" + emoji + " " + pname + """</span>
+  <button class="reset-btn"
+    onclick="if(confirm('식물 유형 재선택?'))location.href='/setup'">
+    🔄 변경
+  </button>
+</header>
+
+<!-- 측정값 카드 -->
+<div class="grid4">
+  <div class="card">
+    <div class="lbl">CO2</div>
+    <div class="val" id="v-co2" style="color:var(--accent)">--</div>
+    <div class="unt">ppm</div>
+  </div>
+  <div class="card">
+    <div class="lbl">온도</div>
+    <div class="val" id="v-temp" style="color:#3b82f6">--</div>
+    <div class="unt">°C</div>
+  </div>
+  <div class="card">
+    <div class="lbl">습도</div>
+    <div class="val" id="v-humi" style="color:#06b6d4">--</div>
+    <div class="unt">%</div>
+  </div>
+  <div class="card">
+    <div class="lbl">환기 상태</div>
+    <div class="val" id="v-icon" style="font-size:2rem">--</div>
+    <div id="v-badge" class="badge">--</div>
+  </div>
+</div>
+
+<!-- 보조광 상태 패널 -->
+<div class="light-panel off" id="light-panel">
+  <div class="lp-top">
+    <div class="lp-icon" id="lp-icon">💤</div>
+    <div>
+      <div class="lp-title" id="lp-title">보조광 대기 중</div>
+      <div class="lp-sub" id="lp-sub">데이터 수집 중...</div>
+    </div>
+    <div style="margin-left:auto;text-align:right;">
+      <div style="font-size:.7rem;color:var(--sub)">현재 시각</div>
+      <div style="font-weight:700;font-size:.9rem" id="lp-time">--</div>
+      <div style="font-size:.7rem;color:var(--sub);margin-top:4px">구글 시트</div>
+      <span class="sheet-badge" id="sheet-status">대기</span>
+    </div>
+  </div>
+  <div class="compare-row">
+    <span>예상 CO2 <span class="compare-val" id="lp-expected">--</span> ppm</span>
+    <span>실제 CO2 <span class="compare-val" id="lp-actual">--</span> ppm</span>
+    <span>차이 <span class="compare-val" id="lp-diff">--</span> ppm</span>
+  </div>
+  <div class="diff-bar-wrap">
+    <div class="diff-bar" id="diff-bar" style="width:0%;background:#555"></div>
+  </div>
+</div>
+
+<!-- LED 스트립 -->
+<div class="np-strip-wrap" id="np-strip"></div>
+
+<!-- CO2 그래프 -->
+<div class="section">
+  <h2>📈 CO2 실시간 추이</h2>
+  <div class="chart-wrap"><canvas id="mainChart"></canvas></div>
+</div>
+
+<!-- 24시간 예상 패턴 -->
+<div class="section">
+  <h2>🕐 24시간 예상 CO2 패턴 (현재 시각 강조)</h2>
+  <div class="hour-grid" id="hour-grid"></div>
+  <div style="display:flex;justify-content:space-between;
+    font-size:.66rem;color:var(--sub);margin-top:4px;">
+    <span>0시</span><span>6시</span><span>12시</span>
+    <span>18시</span><span>23시</span>
+  </div>
+  <div style="font-size:.72rem;color:var(--sub);margin-top:5px;">
+    🟢 CO2 낮음(흡수) &nbsp; 🔴 CO2 높음(배출) &nbsp;
+    <span style="color:#fff;font-weight:700">▲ 현재 시각</span>
+  </div>
+</div>
+
+<!-- 시뮬레이션 -->
+<div class="section">
+  <h2>🔬 CO2 변수 시뮬레이션</h2>
+  <div class="slider-row">
+    <label>💡 빛 강도</label>
+    <input type="range" id="s-light" min="0" max="100" value="50" oninput="runSim()">
+    <span class="slider-val" id="sv-light">50%</span>
+  </div>
+  <div class="slider-row">
+    <label>🌡 온도(°C)</label>
+    <input type="range" id="s-temp" min="5" max="45" value="25" oninput="runSim()">
+    <span class="slider-val" id="sv-temp">25°C</span>
+  </div>
+  <div class="slider-row">
+    <label>💧 토양 수분</label>
+    <input type="range" id="s-water" min="0" max="100" value="60" oninput="runSim()">
+    <span class="slider-val" id="sv-water">60%</span>
+  </div>
+  <div class="slider-row">
+    <label>🪴 식물 개수</label>
+    <input type="range" id="s-count" min="1" max="10" value="1" oninput="runSim()">
+    <span class="slider-val" id="sv-count">1그루</span>
+  </div>
+  <div class="sim-result" id="sim-result">슬라이더를 조절하면 결과가 표시됩니다.</div>
+</div>
+
+<footer id="footer">마지막 갱신: --</footer>
+
+<script>
+var PLANT_TYPE   = \"""" + ptype + """\";
+var PLANT_COLOR  = \"""" + color + """\";
+var HOUR_OFFSET  = """ + offset_str + """;
+var CO2_BASE     = 800;
+var NUM_PIXELS   = 60;
+var LIGHT_THRESH = 150;
+
+// LED 스트립 생성
+(function(){
+  var strip=document.getElementById('np-strip');
+  for(var i=0;i<NUM_PIXELS;i++){
+    var seg=document.createElement('div');
+    seg.className='strip-seg';
+    seg.id='seg-'+i;
+    seg.style.background='#0a0a0a';
+    strip.appendChild(seg);
+  }
+})();
+
+// 24시간 예상 패턴 바 생성
+(function(){
+  var grid=document.getElementById('hour-grid');
+  for(var i=0;i<24;i++){
+    var v=HOUR_OFFSET[i];
+    var bar=document.createElement('div');
+    bar.className='h-bar';
+    bar.id='hbar-'+i;
+    var intensity=Math.min(Math.abs(v)/100,1);
+    bar.style.background=v<0
+      ?'rgba(34,197,94,'+(0.3+intensity*0.7)+')'
+      :'rgba(239,68,68,'+(0.3+intensity*0.7)+')';
+    bar.title=i+'시 예상 오프셋: '+v+'ppm';
+    grid.appendChild(bar);
+  }
+})();
+
+// Chart.js
+var ctx=document.getElementById('mainChart').getContext('2d');
+var chart=new Chart(ctx,{
+  data:{labels:[],datasets:[
+    {type:'line',label:'실측 CO2',data:[],
+     borderColor:PLANT_COLOR,backgroundColor:PLANT_COLOR+'26',
+     borderWidth:2.5,pointRadius:3,tension:0.3,fill:true},
+    {type:'line',label:'예상 CO2',data:[],
+     borderColor:'#a78bfa',borderDash:[5,4],
+     borderWidth:2,pointRadius:0,tension:0.3,fill:false}
+  ]},
+  options:{
+    responsive:true,maintainAspectRatio:false,animation:{duration:250},
+    interaction:{mode:'index',intersect:false},
+    scales:{
+      x:{ticks:{color:'#8892a4',maxTicksLimit:10},grid:{color:'#2e3148'}},
+      y:{ticks:{color:'#8892a4'},grid:{color:'#2e3148'}}
+    },
+    plugins:{
+      legend:{labels:{color:'#e2e8f0',font:{size:11}}},
+      tooltip:{callbacks:{label:function(c){
+        return ' '+c.dataset.label+': '+
+          (c.parsed.y!=null?c.parsed.y.toFixed(1):'')+'ppm';
+      }}}
+    }
+  }
+});
+
+var STATUS={
+  safe:    {icon:'😊',text:'쾌적',          cls:'safe'},
+  caution: {icon:'😐',text:'주의 환기권장', cls:'caution'},
+  danger:  {icon:'🚨',text:'위험 창문열기', cls:'danger'}
+};
+
+var blinkTimer=null,blinkOn=false;
+
+function stripSetAll(r,g,b){
+  var c='#'+('0'+Math.round(r).toString(16)).slice(-2)
+           +('0'+Math.round(g).toString(16)).slice(-2)
+           +('0'+Math.round(b).toString(16)).slice(-2);
+  for(var i=0;i<NUM_PIXELS;i++)
+    document.getElementById('seg-'+i).style.background=c;
+}
+function stripOff(){
+  for(var i=0;i<NUM_PIXELS;i++)
+    document.getElementById('seg-'+i).style.background='#0a0a0a';
+}
+function stripProgress(ratio){
+  var count=Math.floor(ratio*NUM_PIXELS);
+  for(var i=0;i<NUM_PIXELS;i++){
+    var seg=document.getElementById('seg-'+i);
+    if(i<count){
+      var r,g;
+      if(ratio<0.5){r=ratio*2*255;g=200;}
+      else{r=200;g=(1-(ratio-0.5)*2)*200;}
+      seg.style.background='rgb('+Math.round(r)+','+Math.round(g)+',0)';
+    } else seg.style.background='#0a0a0a';
+  }
+}
+function updateStrip(mode,co2){
+  if(blinkTimer){clearInterval(blinkTimer);blinkTimer=null;}
+  if(mode==='light_assist'){
+    stripSetAll(220,220,190);
+  } else if(mode==='good'){
+    var ratio=Math.min(Math.max((co2-400)/1600,0),1);
+    stripProgress(ratio);
+  } else if(mode==='cam_night'){
+    stripSetAll(0,0,100);
+  } else if(mode==='cam_day'){
+    stripSetAll(60,40,0);
+  } else if(mode==='caution'){
+    blinkTimer=setInterval(function(){
+      blinkOn=!blinkOn;
+      if(blinkOn)stripSetAll(80,50,0);else stripOff();
+    },1000);
+  } else if(mode==='danger'){
+    blinkTimer=setInterval(function(){
+      blinkOn=!blinkOn;
+      if(blinkOn)stripSetAll(150,0,0);else stripOff();
+    },300);
+  } else stripSetAll(0,0,15);
+}
+
+// 현재 시각 바 강조
+function highlightHour(h){
+  for(var i=0;i<24;i++){
+    var bar=document.getElementById('hbar-'+i);
+    if(!bar)continue;
+    bar.style.outline=i===h?'2px solid #fff':'none';
+    bar.style.zIndex =i===h?'10':'1';
+    bar.style.position='relative';
+  }
+}
+
+function fetchData(){
+  fetch('/data')
+    .then(function(r){return r.json();})
+    .then(function(d){
+      // 측정값
+      document.getElementById('v-co2').textContent =d.co2.toFixed(1);
+      document.getElementById('v-temp').textContent=d.temp.toFixed(1);
+      document.getElementById('v-humi').textContent=d.humi.toFixed(1);
+      var st=STATUS[d.level]||STATUS.safe;
+      document.getElementById('v-icon').textContent=st.icon;
+      var b=document.getElementById('v-badge');
+      b.textContent=st.text; b.className='badge '+st.cls;
+
+      // 보조광 패널
+      var panel=document.getElementById('light-panel');
+      var on=d.light_on||false;
+      panel.className='light-panel '+(on?'on':'off');
+      document.getElementById('lp-icon').textContent=on?'💡':'⭕';
+      document.getElementById('lp-title').textContent=
+        on?'💡 보조광 ON — 광합성 보조 중!':'보조광 OFF';
+      document.getElementById('lp-title').style.color=
+        on?'#fffccc':'#e2e8f0';
+      document.getElementById('lp-sub').textContent=d.light_reason||'';
+      document.getElementById('lp-time').textContent=d.current_time||'--';
+
+      var exp=d.expected_co2||0;
+      var act=d.co2||0;
+      var diff=d.diff||0;
+      document.getElementById('lp-expected').textContent=exp.toFixed(0);
+      document.getElementById('lp-actual').textContent  =act.toFixed(0);
+      document.getElementById('lp-diff').textContent    =
+        (diff>0?'+':'')+diff.toFixed(0);
+      document.getElementById('lp-diff').style.color=
+        diff>LIGHT_THRESH?'#ef4444':(diff<-LIGHT_THRESH?'#22c55e':'#f59e0b');
+
+      // 차이 바
+      var pct=Math.min(Math.abs(diff)/300*100,100);
+      var dbar=document.getElementById('diff-bar');
+      dbar.style.width=pct+'%';
+      dbar.style.background=diff>LIGHT_THRESH?'#ef4444':
+                             (diff<-LIGHT_THRESH?'#22c55e':'#f59e0b');
+
+      // 그래프 (실측 + 예상)
+      var hist=d.history||[];
+      var ts=d.ts||[];
+      var exp_hist=d.expected_history||[];
+      chart.data.labels=ts;
+      chart.data.datasets[0].data=hist;
+      chart.data.datasets[1].data=exp_hist;
+      if(hist.length>0){
+        var all=hist.concat(exp_hist).filter(function(v){return v!=null;});
+        var mn=Math.min.apply(null,all);
+        var mx=Math.max.apply(null,all);
+        var pad=Math.max(mx-mn,50)*0.2;
+        chart.options.scales.y.min=Math.max(0,Math.floor(mn-pad));
+        chart.options.scales.y.max=Math.ceil(mx+pad);
+      }
+      chart.update();
+
+      // LED
+      updateStrip(d.np_mode||'idle',d.co2);
+
+      // 현재 시각 바 강조
+      highlightHour(d.current_hour||0);
+
+      // 구글 시트
+      var ss=document.getElementById('sheet-status');
+      ss.textContent=d.last_sheet_sent!==undefined
+        ?d.last_sheet_sent+'초 전':'대기';
+
+      document.getElementById('footer').textContent=
+        '갱신: '+new Date().toLocaleTimeString('ko-KR')+
+        ' · 가동 '+d.uptime+'초';
+    })
+    .catch(function(e){console.warn(e);});
+}
+fetchData();
+setInterval(fetchData,2000);
+
+function runSim(){
+  var light=+document.getElementById('s-light').value;
+  var temp =+document.getElementById('s-temp').value;
+  var water=+document.getElementById('s-water').value;
+  var count=+document.getElementById('s-count').value;
+  document.getElementById('sv-light').textContent=light+'%';
+  document.getElementById('sv-temp').textContent =temp+'C';
+  document.getElementById('sv-water').textContent=water+'%';
+  document.getElementById('sv-count').textContent=count+'그루';
+  var abs=0;
+  if(PLANT_TYPE==='CAM'){
+    abs=(water/100)*0.6*count-(light/100)*0.4;
+    if(temp>35)abs*=1.1;
+  }else if(PLANT_TYPE==='C4'){
+    var tf=temp>=25&&temp<=40?1.2:(temp<15?0.4:0.8);
+    abs=(light/100)*tf*(water/100)*1.5*count;
+  }else{
+    var tf=temp>=15&&temp<=28?1.0:(temp>35?0.3:0.6);
+    abs=(light/100)*tf*(water/100)*count;
+  }
+  var delta=-(abs*60);
+  var dir=delta<0?'감소(흡수)':'증가(배출)';
+  var mag=Math.abs(delta);
+  var tips=[];
+  if(PLANT_TYPE==='CAM'){
+    if(light>70)tips.push('CAM은 강한 빛에서 기공 닫아 흡수 감소');
+    if(water<30)tips.push('수분 부족시 야간 흡수도 감소');
+  }else if(PLANT_TYPE==='C4'){
+    if(temp<15)tips.push('C4는 저온에서 효율 급감');
+    if(light<30)tips.push('빛 부족시 흡수량 급감');
+  }else{
+    if(temp>32)tips.push('35도 이상 광호흡 증가로 효율 저하');
+    if(light>80)tips.push('C3는 광포화점 이상 추가 효과 없음');
+  }
+  var tipHtml=tips.length?tips.join('<br>'):'현재 조건 광합성에 적합';
+  document.getElementById('sim-result').innerHTML=
+    '<b>예상 CO2 변화:</b> '+dir+
+    ' <span style="color:var(--accent);font-size:1.05rem;font-weight:700;">'+
+    mag.toFixed(1)+' ppm/h</span><br>'+
+    '<b>광합성 효율 지수:</b> '+(Math.max(0,abs)*100).toFixed(0)+' / 100<br>'+
+    '<b>분석:</b> '+tipHtml;
+}
+runSim();
+</script>
+</body>
+</html>"""
+    return html
+
+
+# ──────────────────────────────────────────────
+#  HTTP 헬퍼
+# ──────────────────────────────────────────────
+def send_response(conn, status, ctype, body):
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    hdr = (
+        "HTTP/1.1 {}\r\n"
+        "Content-Type: {}; charset=utf-8\r\n"
+        "Content-Length: {}\r\n"
+        "Connection: close\r\n\r\n"
+    ).format(status, ctype, len(body))
+    conn.sendall(hdr.encode("utf-8"))
+    mv = memoryview(body)
+    for i in range(0, len(body), 512):
+        conn.sendall(mv[i:i+512])
+
+
+def make_json():
+    hist  = state["co2_history"]
+    ptype = state["plant_type"]
+    hour  = get_current_hour()
+
+    # 예상 CO2 히스토리 (그래프용)
+    expected_history = []
+    profile = PLANT_PROFILES.get(ptype, PLANT_PROFILES["C3"])
+    for i in range(len(hist)):
+        expected_history.append(CO2_BASE + profile["hourly_co2_offset"][hour])
+
+    elapsed_since_sheet = time.ticks_diff(
+        time.ticks_ms(), last_sheet_tick
+    ) // 1000
+
+    return json.dumps({
+        "co2":              state["co2"],
+        "temp":             state["temp"],
+        "humi":             state["humi"],
+        "level":            state["level"],
+        "history":          hist,
+        "expected_history": expected_history,
+        "ts":               state["ts"],
+        "uptime":           state["uptime"],
+        "plant_type":       ptype,
+        "elapsed_min":      state["elapsed_min"],
+        "np_mode":          NP_STATE["mode"],
+        "light_on":         NP_STATE["light_on"],
+        "light_reason":     NP_STATE["light_reason"],
+        "expected_co2":     NP_STATE["expected_co2"],
+        "diff":             NP_STATE["diff"],
+        "current_hour":     hour,
+        "current_time":     get_time_str(),
+        "last_sheet_sent":  elapsed_since_sheet
+    })
+
+
+# ──────────────────────────────────────────────
+#  서버 & 메인 루프
+# ──────────────────────────────────────────────
+def create_server(port=80):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", port))
+    s.listen(4)
+    s.setblocking(False)
+    return s
+
+server = create_server()
+print("[HTTP] 서버 시작 -> http://{}/".format(ip_address))
+print("브라우저에서 위 주소로 접속하세요!")
+
+SENSOR_INTERVAL  = 2000
+last_sensor_tick = time.ticks_ms()
+
+while True:
+    now_tick = time.ticks_ms()
+
+    apply_np_state(state["co2"])
+
+    if time.ticks_diff(now_tick, last_sensor_tick) >= SENSOR_INTERVAL:
+        last_sensor_tick     = now_tick
+        state["uptime"]      = time.ticks_diff(now_tick, start_tick) // 1000
+        state["elapsed_min"] = state["uptime"] // 60
+        ptype                = state["plant_type"]
+        hour                 = get_current_hour()
+
+        if sensor:
+            try:
+                if sensor.get_status_ready():
+                    co2, temp, humi = sensor.read_measurement()
+                    state["co2"]    = co2
+                    state["temp"]   = temp
+                    state["humi"]   = humi
+                    state["level"]  = classify_co2(co2)
+            except Exception as e:
+                print("[Sensor] 에러:", e)
+        else:
+            if ptype:
+                dummy          = gen_dummy_co2(ptype, hour)
+                state["co2"]   = dummy
+                state["temp"]  = 22.0
+                state["humi"]  = 55.0
+                state["level"] = classify_co2(dummy)
+
+        if ptype and state["co2"] > 0:
+            h = state["co2_history"]
+            t = state["ts"]
+            h.append(round(state["co2"], 1))
+            t.append(get_time_str())
+            if len(h) > GRAPH_MAX_POINTS:
+                h.pop(0); t.pop(0)
+
+            # 보조광 판단
+            update_light_status(state["co2"], ptype, state["level"])
+
+            if NP_STATE["light_on"]:
+                print("[LED] 보조광 ON | 예상:{:.0f} 실제:{:.0f} 차이:{:+.0f}".format(
+                    NP_STATE["expected_co2"],
+                    state["co2"],
+                    NP_STATE["diff"]
+                ))
+
+        if time.ticks_diff(now_tick, last_sheet_tick) >= SHEET_LOG_INTERVAL * 1000:
+            last_sheet_tick = now_tick
+            if ptype and state["co2"] > 0:
+                send_to_sheet(
+                    state["co2"], state["temp"], state["humi"], ptype,
+                    NP_STATE["expected_co2"],
+                    NP_STATE["diff"],
+                    NP_STATE["light_on"]
+                )
+
+    try:
+        conn, addr = server.accept()
+        conn.setblocking(True)
+        try:
+            raw = conn.recv(1024).decode("utf-8", "ignore")
+            if not raw:
+                conn.close()
+                continue
+            first = raw.split("\r\n")[0]
+            parts = first.split(" ")
+            path  = parts[1] if len(parts) > 1 else "/"
+
+            if path == "/" or path == "/index.html":
+                if not state["plant_type"]:
+                    conn.sendall(
+                        b"HTTP/1.1 302 Found\r\n"
+                        b"Location: /setup\r\n"
+                        b"Connection: close\r\n\r\n"
+                    )
+                else:
+                    send_response(conn, "200 OK", "text/html",
+                                  build_dashboard_html())
+            elif path == "/setup":
+                send_response(conn, "200 OK", "text/html", SETUP_PAGE)
+            elif path.startswith("/set_plant"):
+                ptype_new = "C3"
+                if "type=" in path:
+                    ptype_new = path.split("type=")[1].split("&")[0].upper()
+                if ptype_new in PLANT_PROFILES:
+                    state["plant_type"]   = ptype_new
+                    state["co2_history"]  = []
+                    state["ts"]           = []
+                    state["elapsed_min"]  = 0
+                    start_tick            = time.ticks_ms()
+                    np_off()
+                    print("[Setup] 식물 설정:", ptype_new)
+                send_response(conn, "200 OK", "application/json",
+                              json.dumps({"ok": True, "plant": ptype_new}))
+            elif path == "/data":
+                send_response(conn, "200 OK", "application/json", make_json())
+            else:
+                send_response(conn, "404 Not Found", "text/plain", "Not Found")
+
+        except Exception as e:
+            print("[HTTP] 처리 에러:", e)
+        finally:
+            conn.close()
+
+    except OSError:
+        pass
+
+    time.sleep_ms(10)
